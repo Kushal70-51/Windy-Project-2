@@ -54,14 +54,14 @@ import numpy as np
 # distance, then update this constant.
 APPROX_KM_ACROSS_FRAME = 100.0
 
-# Region of interest (ROI) around the plant. Since the map is always
-# centered on PLANT_LAT/PLANT_LON, the plant sits at the exact center of
-# every frame -- so the ROI is just a centered box. Expressed as a
-# fraction of the frame's width/height (0.4 = a centered box covering 40%
-# of the frame in each dimension). Keeping the ROI smaller than the full
-# frame focuses the analysis on what actually matters for the plant, and
-# avoids being thrown off by clouds far away that will never reach it.
-ROI_FRACTION = 0.4
+# Map-only ROI geometry for the fixed 1600x1000 Windy capture. The browser
+# header and timeline are deliberately excluded because their controls are
+# not atmospheric motion.
+MAP_TOP_FRACTION = 0.08
+MAP_BOTTOM_FRACTION = 0.24
+ROI_WIDTH_FRACTION = 0.30
+ROI_HEIGHT_FRACTION = 0.34
+PLANT_MAP_Y_FRACTION = 0.64
 
 # Sample every Nth video frame instead of every single one. Consecutive
 # frames in a screen recording are often near-identical (same underlying
@@ -77,13 +77,16 @@ FRAME_SAMPLE_STEP = 3
 CLOUD_BRIGHTNESS_THRESHOLD = 150
 
 
-def _get_roi_box(width, height, fraction=ROI_FRACTION):
-    """Returns (x1, y1, x2, y2) pixel coordinates for a box of the given
-    size fraction, centered in a frame of the given width/height."""
-    box_w = int(width * fraction)
-    box_h = int(height * fraction)
+def _get_roi_box(width, height):
+    """Return the plant ROI inside the map, excluding header/timeline UI."""
+    map_top = int(height * MAP_TOP_FRACTION)
+    map_bottom = int(height * (1.0 - MAP_BOTTOM_FRACTION))
+    map_height = max(1, map_bottom - map_top)
+    box_w = int(width * ROI_WIDTH_FRACTION)
+    box_h = int(map_height * ROI_HEIGHT_FRACTION)
     x1 = (width - box_w) // 2
-    y1 = (height - box_h) // 2
+    plant_y = map_top + int(map_height * PLANT_MAP_Y_FRACTION)
+    y1 = max(map_top, min(map_bottom - box_h, plant_y - box_h // 2))
     return x1, y1, x1 + box_w, y1 + box_h
 
 
@@ -109,12 +112,12 @@ def _direction_from_vector(dx, dy):
     return directions[idx]
 
 
-def analyze_video(video_path, roi_fraction=ROI_FRACTION, sample_step=FRAME_SAMPLE_STEP):
+def analyze_video(video_path, sample_step=FRAME_SAMPLE_STEP):
     """
     Processes the given video file and returns a dict:
         {
             "avg_direction":     e.g. "Northeast"
-            "avg_speed_kmh":     e.g. 14.3   (rough estimate)
+            "avg_motion_score":  e.g. 1.2    (relative motion only)
             "coverage_start_pct": e.g. 42.1  (cloud % in ROI, first sampled frame)
             "coverage_end_pct":   e.g. 55.8  (cloud % in ROI, last sampled frame)
             "coverage_trend":    "increasing" / "decreasing" / "stable"
@@ -149,9 +152,7 @@ def analyze_video(video_path, roi_fraction=ROI_FRACTION, sample_step=FRAME_SAMPL
         return None
 
     height, width = frames[0].shape[:2]
-    x1, y1, x2, y2 = _get_roi_box(width, height, roi_fraction)
-    km_per_px = APPROX_KM_ACROSS_FRAME / width
-    seconds_between_samples = sample_step / fps  # accounts for frame skipping
+    x1, y1, x2, y2 = _get_roi_box(width, height)
 
     coverage_pcts = []
     flow_vectors = []
@@ -188,13 +189,18 @@ def analyze_video(video_path, roi_fraction=ROI_FRACTION, sample_step=FRAME_SAMPL
     else:
         avg_dx, avg_dy = 0.0, 0.0
 
-    avg_direction = _direction_from_vector(avg_dx, avg_dy)
-
-    pixel_speed_per_sample = float(np.hypot(avg_dx, avg_dy))
-    km_per_sample = pixel_speed_per_sample * km_per_px
-    speed_kmh = (
-        (km_per_sample / seconds_between_samples) * 3600.0
-        if seconds_between_samples > 0 else 0.0
+    vector_magnitudes = [float(np.hypot(dx, dy)) for dx, dy in flow_vectors]
+    mean_magnitude = float(np.mean(vector_magnitudes)) if vector_magnitudes else 0.0
+    directional_consistency = (
+        float(np.hypot(avg_dx, avg_dy)) / mean_magnitude if mean_magnitude > 1e-9 else 0.0
+    )
+    # Windy's animation playback seconds do not equal real weather time, so
+    # pixel movement must not be converted to km/h. It remains a useful
+    # dimensionless feature after normalizing by ROI width.
+    motion_score = mean_magnitude / max(1, x2 - x1) * 100.0
+    avg_direction = (
+        _direction_from_vector(avg_dx, avg_dy)
+        if directional_consistency >= 0.35 else "negligible / stationary"
     )
 
     # ---- Cloud coverage trend (start of clip vs end of clip) ----
@@ -213,7 +219,7 @@ def analyze_video(video_path, roi_fraction=ROI_FRACTION, sample_step=FRAME_SAMPL
         "Cloud motion analysis (computed via optical flow on the recorded "
         "video, NOT LLM-estimated -- treat these as ground-truth numbers):\n"
         f"- Dominant cloud motion direction over the plant's area: {avg_direction}\n"
-        f"- Estimated cloud movement speed: ~{speed_kmh:.1f} km/h\n"
+        f"- Relative cloud-motion score: {motion_score:.3f} (not km/h)\n"
         f"- Cloud coverage directly over the plant: {coverage_start:.1f}% at "
         f"the start of the clip -> {coverage_end:.1f}% at the end "
         f"({coverage_trend})\n"
@@ -222,7 +228,8 @@ def analyze_video(video_path, roi_fraction=ROI_FRACTION, sample_step=FRAME_SAMPL
 
     return {
         "avg_direction": avg_direction,
-        "avg_speed_kmh": round(speed_kmh, 2),
+        "avg_motion_score": round(motion_score, 4),
+        "directional_consistency": round(directional_consistency, 3),
         "coverage_start_pct": round(coverage_start, 2),
         "coverage_end_pct": round(coverage_end, 2),
         "coverage_trend": coverage_trend,

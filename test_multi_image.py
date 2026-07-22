@@ -27,10 +27,16 @@ from playwright.sync_api import sync_playwright
 
 from config import (
     PLANT_NAME, PLANT_LAT, PLANT_LON, ZOOM_LEVEL, VIEWPORT_WIDTH, VIEWPORT_HEIGHT,
-    LAYERS, RECORD_ANIMATION_VIDEO, ANIMATION_LAYER, ANIMATION_RECORD_SECONDS,
+    LAYERS, RECORD_ANIMATION_VIDEO, ANIMATION_LAYER, ANIMATION_RECORD_SECONDS as _CONFIG_ANIMATION_RECORD_SECONDS,
     VIDEO_DIR, STORAGE_STATE_PATH, SCREENSHOT_DIR, RUN_INTERVAL_SECONDS,
 )
 from run_pipeline import run_prediction_pipeline
+
+# Override: the final clean clip should be 20 seconds long, regardless of
+# whatever value is set in config.py. If you'd rather control this from
+# config.py instead, just set ANIMATION_RECORD_SECONDS = 20 there and
+# remove this override line.
+ANIMATION_RECORD_SECONDS = 20
 
 
 def ensure_login():
@@ -403,7 +409,7 @@ def record_cloud_animation() -> Path | None:
     if not RECORD_ANIMATION_VIDEO:
         return None
 
-    print(f"\nRecording {ANIMATION_RECORD_SECONDS}s of the '{ANIMATION_LAYER}' animation...")
+    print(f"\nRecording animation -- final clean clip will be {ANIMATION_RECORD_SECONDS}s of '{ANIMATION_LAYER}'...")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -413,6 +419,14 @@ def record_cloud_animation() -> Path | None:
             record_video_dir=str(VIDEO_DIR),
             record_video_size={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
         )
+
+        # Playwright starts recording the video the moment this context is
+        # created (not from page.goto()) -- so THIS is the true t=0 for the
+        # video file. Capturing it here lets us later compute exactly how
+        # many seconds into the real video our setup steps actually took,
+        # instead of guessing a fixed number.
+        video_start_time = time.time()
+
         page = context.new_page()
 
         # IMPORTANT: some layers (e.g. Satellite) only get a real
@@ -435,7 +449,6 @@ def record_cloud_animation() -> Path | None:
                 f"?{ANIMATION_LAYER},{PLANT_LAT},{PLANT_LON},{ZOOM_LEVEL},p:cities"
             )
         page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        record_start_time = time.time()  # marks when this browser session actually started
 
         # Wait long enough for the map tiles AND the timeline/animation
         # frames to fully load before we click play. Clicking play too
@@ -459,12 +472,6 @@ def record_cloud_animation() -> Path | None:
         # Step 2: click the play button to start the time-lapse animation.
         click_play_button(page)
 
-        # Capture the time right after Play was clicked -- this is the
-        # point the trimmed clean video should start from, regardless of
-        # how long the steps below (speed, play-with-forecast, marker,
-        # warm-up) take.
-        play_click_time = time.time()
-
         # Step 2b: select the slowest playback speed so the recorded clip
         # plays back smoothly instead of jumping through frames too fast.
         click_slow_animation_speed(page)
@@ -482,11 +489,20 @@ def record_cloud_animation() -> Path | None:
         CACHE_WARMUP_SECONDS = 6
         page.wait_for_timeout(CACHE_WARMUP_SECONDS * 1000)
 
-        # skip_seconds is now a FIXED 24 seconds -- the trimmed clean
-        # video always starts 24s into the full recording.
-        skip_seconds = 24
-        print(f"  Trimming at a fixed {skip_seconds}s into the recording -- "
-              f"keeping the next {ANIMATION_RECORD_SECONDS}s as the clean clip.")
+        # FIX: skip_seconds is now measured from the ACTUAL elapsed time
+        # since the video started recording (video_start_time), instead
+        # of a fixed guessed number. All the steps above (15s tile-load
+        # wait, popup/overlay dismissal, timeline seek, play click,
+        # speed/forecast toggles, marker click, warm-up) take a variable
+        # amount of real time depending on page/network speed -- a fixed
+        # "skip 24s" could easily be too short (still cutting into a
+        # static/loading frame) or too long (skipping past clean frames)
+        # on any given run. Measuring it directly is what actually makes
+        # the trim line up with real, smooth playback every time.
+        skip_seconds = round(time.time() - video_start_time)
+        print(f"  Measured {skip_seconds}s of real setup time before clean playback begins -- "
+              f"will trim the full recording at {skip_seconds}s and keep the next "
+              f"{ANIMATION_RECORD_SECONDS}s as the clean clip.")
 
         time.sleep(ANIMATION_RECORD_SECONDS)
 
@@ -509,10 +525,10 @@ def record_cloud_animation() -> Path | None:
 
     print(f"  [OK] Full video saved: {full_path.resolve()}")
 
-    # Trim starting right after the Play click, keeping the next
-    # ANIMATION_RECORD_SECONDS as the clean clip. Requires ffmpeg to be
-    # installed and on PATH -- if it isn't, we fall back to using the full
-    # (untrimmed) video instead.
+    # Trim starting right after real setup finished (skip_seconds, measured
+    # above), keeping the next ANIMATION_RECORD_SECONDS as the clean clip.
+    # Requires ffmpeg to be installed and on PATH -- if it isn't, we fall
+    # back to using the full (untrimmed) video instead.
     clean_path = VIDEO_DIR / f"{PLANT_NAME}_{ANIMATION_LAYER}_{timestamp}_clean.mp4"
     try:
         import subprocess

@@ -8,7 +8,30 @@ new feature/ML pipeline files, and means you only ever update plant
 details in ONE place.
 """
 
+import os
 from pathlib import Path
+
+
+# ---- API credentials ----
+# Keep secrets in the project .env file (which is excluded from version
+# control). An environment variable takes precedence, which also supports
+# deployments that inject credentials externally.
+ENV_FILE_PATH = Path(__file__).resolve().with_name(".env")
+
+
+def _read_env_value(name: str) -> str:
+    """Return a value from .env without requiring an extra dependency."""
+    try:
+        for line in ENV_FILE_PATH.read_text(encoding="utf-8").splitlines():
+            key, separator, value = line.partition("=")
+            if separator and key.strip() == name:
+                return value.strip().strip('"').strip("'")
+    except FileNotFoundError:
+        pass
+    return ""
+
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", _read_env_value("GEMINI_API_KEY")).strip()
 
 # ---- Plant details ----
 PLANT_NAME = "SIRMOUR"
@@ -40,7 +63,9 @@ LAYERS = {
 # ---- Animation video settings ----
 RECORD_ANIMATION_VIDEO = True
 ANIMATION_LAYER = "satellite"
-ANIMATION_RECORD_SECONDS = 20
+# Short enough to avoid Windy's animation loop/reversal contaminating
+# optical-flow features. This measures motion; it is not the forecast horizon.
+ANIMATION_RECORD_SECONDS = 8
 
 # ---- Forecast settings ----
 NUM_FORECAST_BLOCKS = 8       # 8 x 15 min = next 2 hours
@@ -55,8 +80,27 @@ PREDICTIONS_DIR = Path("energy_predictions")
 FEATURES_LOG_DIR = Path("features_log")
 MODELS_DIR = Path("models")
 ACCURACY_REPORTS_DIR = Path("accuracy_reports")
+HISTORIC_CASES_DIR = Path("historic_cases")
 
-for _dir in (SCREENSHOT_DIR, VIDEO_DIR, PREDICTIONS_DIR, FEATURES_LOG_DIR, MODELS_DIR, ACCURACY_REPORTS_DIR):
+# ---- Case-Based Reasoning retrieval ----
+# These weights express the relative importance of visual conditions and
+# solar position when comparing a new situation with past feature rows.
+# Values are applied after per-column z-score normalization.
+CBR_TOP_K = 8
+CBR_FEATURE_WEIGHTS = {
+    "solar_elevation_deg": 2.5,
+    "minute_of_day": 1.5,
+    "clouds_bright_pixel_pct": 2.0,
+    "satellite_bright_pixel_pct": 2.0,
+    "motion_coverage_end_pct": 1.8,
+    "motion_score": 1.3,
+    "motion_directional_consistency": 0.8,
+    "motion_direction_deg": 1.2,
+    "rain_bright_pixel_pct": 1.0,
+    "solarpower_bright_pixel_pct": 1.0,
+}
+
+for _dir in (SCREENSHOT_DIR, VIDEO_DIR, PREDICTIONS_DIR, FEATURES_LOG_DIR, MODELS_DIR, ACCURACY_REPORTS_DIR, HISTORIC_CASES_DIR):
     _dir.mkdir(parents=True, exist_ok=True)
 
 MODEL_PATH = MODELS_DIR / "generation_model.pkl"
