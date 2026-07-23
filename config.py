@@ -70,7 +70,11 @@ ANIMATION_RECORD_SECONDS = 8
 # ---- Forecast settings ----
 NUM_FORECAST_BLOCKS = 8       # 8 x 15 min = next 2 hours
 BLOCK_MINUTES = 15
-RUN_INTERVAL_SECONDS = 20 * 60
+
+# ---- Capture schedule ----
+# Instead of running on a fixed interval, capture only at these fixed
+# times each day (24h "HH:MM"), covering morning to evening.
+CAPTURE_TIMES = ["06:45", "08:15", "09:45", "11:15", "12:45", "14:15", "15:45"]
 
 # ---- Paths ----
 STORAGE_STATE_PATH = Path("windy_login.json")

@@ -28,7 +28,7 @@ from playwright.sync_api import sync_playwright
 from config import (
     PLANT_NAME, PLANT_LAT, PLANT_LON, ZOOM_LEVEL, VIEWPORT_WIDTH, VIEWPORT_HEIGHT,
     LAYERS, RECORD_ANIMATION_VIDEO, ANIMATION_LAYER, ANIMATION_RECORD_SECONDS as _CONFIG_ANIMATION_RECORD_SECONDS,
-    VIDEO_DIR, STORAGE_STATE_PATH, SCREENSHOT_DIR, RUN_INTERVAL_SECONDS,
+    VIDEO_DIR, STORAGE_STATE_PATH, SCREENSHOT_DIR, CAPTURE_TIMES,
 )
 from run_pipeline import run_prediction_pipeline
 
@@ -551,9 +551,6 @@ def record_cloud_animation() -> Path | None:
         return full_path
 
 
-RUN_INTERVAL = RUN_INTERVAL_SECONDS
-
-
 def run_once():
     """Captures screenshots, records a cloud-animation video, and runs
     the LOCAL feature-extraction + ML prediction pipeline (no LLM)."""
@@ -567,12 +564,38 @@ def run_once():
     run_prediction_pipeline(image_map, video_path)
 
 
+def _next_capture_datetime(now: datetime.datetime) -> datetime.datetime:
+    """Returns the next scheduled capture time (today or tomorrow) from
+    config.CAPTURE_TIMES, whichever comes first after `now`."""
+    today_candidates = []
+    for time_str in CAPTURE_TIMES:
+        hour, minute = map(int, time_str.split(":"))
+        candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if candidate > now:
+            today_candidates.append(candidate)
+
+    if today_candidates:
+        return min(today_candidates)
+
+    # All of today's capture times have passed -- schedule the first one tomorrow.
+    hour, minute = map(int, CAPTURE_TIMES[0].split(":"))
+    return (now + datetime.timedelta(days=1)).replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+
 def main():
     ensure_login()
 
     run_count = 0
 
     while True:
+        next_run = _next_capture_datetime(datetime.datetime.now())
+        wait_seconds = (next_run - datetime.datetime.now()).total_seconds()
+
+        print(f"\nNext capture scheduled at {next_run.strftime('%Y-%m-%d %H:%M:%S')} "
+              f"(waiting {wait_seconds / 60:.1f} minutes)...")
+        print("(Press Ctrl+C to stop the script.)")
+        time.sleep(max(0, wait_seconds))
+
         run_count += 1
         start_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print("\n" + "#" * 60)
@@ -583,13 +606,6 @@ def main():
             run_once()
         except Exception as e:
             print(f"\n[ERROR] Run {run_count} failed: {e}")
-
-        next_run_time = (
-            datetime.datetime.now() + datetime.timedelta(seconds=RUN_INTERVAL)
-        ).strftime("%Y-%m-%d %H:%M:%S")
-        print(f"\nWaiting {RUN_INTERVAL // 60} minutes... next run at approximately {next_run_time}")
-        print("(Press Ctrl+C to stop the script.)")
-        time.sleep(RUN_INTERVAL)
 
 
 if __name__ == "__main__":
