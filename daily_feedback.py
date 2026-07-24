@@ -25,6 +25,7 @@ decisions in this project.
 """
 
 import csv
+import json
 import sys
 import datetime
 from pathlib import Path
@@ -38,6 +39,16 @@ POWER_COLUMN_MW = "Active Power (MW)"   # expects MW already -- convert first if
 
 ACTUAL_COLUMN_NAME = "Actual Generation (MW)"
 ACCURACY_LOG_PATH = Path("accuracy_reports") / f"{config.PLANT_NAME}_daily_accuracy.csv"
+
+# ---- Raw company meter-export columns (the daily_actuals_inbox format) ----
+# Same shape as historic_cases/*_SOLAR_INV.csv: TimeStamp + Active Power in
+# kW (not MW yet) + raw sensor columns. Update this if the company ever
+# changes their export's column names/order.
+RAW_METER_COLUMNS = [
+    "TimeStamp", "Active Power (kW)", "POA (W/m2)", "GHI (W/m2)",
+    "Wind Speed (m/s)", "Wind Direction (DEG.)", "AMB TEMP", "MOD TEMP", "Humidity",
+]
+MERGED_STORE_PATH = config.HISTORIC_CASES_DIR / "merged_scada_data.csv"
 
 
 def _load_actual_readings(actual_csv_path: str) -> dict:
@@ -150,12 +161,14 @@ def _compute_error_metrics(matched_rows: list) -> dict:
     }
 
 
-def _log_accuracy(metrics: dict) -> None:
-    """Appends today's metrics as a new row to the running accuracy log,
-    so accuracy over time can be reviewed later."""
+def _log_accuracy(metrics: dict, date_str: str = None) -> None:
+    """Appends a metrics row to the running accuracy log, so accuracy over
+    time can be reviewed later. Defaults to today's date; pass date_str
+    explicitly when logging metrics for a day other than today (e.g. a
+    company export dropped a day late)."""
     ACCURACY_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-    row = {"date": datetime.date.today().isoformat(), **metrics}
+    row = {"date": date_str or datetime.date.today().isoformat(), **metrics}
     file_exists = ACCURACY_LOG_PATH.exists()
 
     with open(ACCURACY_LOG_PATH, "a", newline="", encoding="utf-8") as f:
@@ -188,6 +201,245 @@ def sync_historic_case_actuals() -> int:
         return 0
     updated_count, _ = _update_case_store_with_actuals(readings)
     return updated_count
+
+
+def _merge_meter_csv_into_store(csv_path: Path) -> set:
+    """
+    Appends one raw company meter-export CSV (TimeStamp + Active Power in
+    kW + sensor columns -- no MW column yet, the same shape the plant
+    sends every evening) into historic_cases/merged_scada_data.csv, keyed
+    by timestamp so re-dropping the same file twice updates rows instead
+    of duplicating them.
+
+    Negative Active Power (kW) readings are clipped to 0 (no generation --
+    the same convention already used everywhere else in this project), and
+    Active Power (MW) is derived from the clipped kW value.
+
+    Returns the set of calendar-date strings ("YYYY-MM-DD") the file
+    touched, so the caller knows which day(s) to analyze.
+    """
+    with open(csv_path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames != RAW_METER_COLUMNS:
+            raise ValueError(
+                f"unexpected columns {reader.fieldnames} -- expected exactly {RAW_METER_COLUMNS}"
+            )
+        new_rows = list(reader)
+
+    merged_header = RAW_METER_COLUMNS + ["Active Power (MW)"]
+    existing_by_time = {}
+    if MERGED_STORE_PATH.exists():
+        with open(MERGED_STORE_PATH, "r", newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                existing_by_time[row["TimeStamp"]] = row
+
+    touched_dates = set()
+    for row in new_rows:
+        kw = max(0.0, float(row["Active Power (kW)"]))
+        row = dict(row)
+        row["Active Power (kW)"] = str(kw)
+        row["Active Power (MW)"] = str(kw / 1000.0)
+        existing_by_time[row["TimeStamp"]] = row
+        touched_dates.add(row["TimeStamp"][:10])
+
+    sorted_times = sorted(
+        existing_by_time.keys(),
+        key=lambda t: datetime.datetime.strptime(t, "%Y-%m-%d %H:%M:%S"),
+    )
+    with open(MERGED_STORE_PATH, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=merged_header)
+        writer.writeheader()
+        for t in sorted_times:
+            writer.writerow(existing_by_time[t])
+
+    return touched_dates
+
+
+def _load_features_log_rows_for_date(date_str: str) -> list:
+    """Returns every features_log.csv row for date_str that has both a
+    predicted and a (now-synced) actual generation value."""
+    path = config.FEATURES_LOG_DIR / f"{config.PLANT_NAME}_features_log.csv"
+    if not path.exists():
+        return []
+
+    matched = []
+    with open(path, "r", newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            if not row.get("Time", "").startswith(date_str):
+                continue
+            try:
+                predicted_mw = float(row.get("Predicted Generation (MW)"))
+                actual_mw = float(row.get(ACTUAL_COLUMN_NAME))
+            except (TypeError, ValueError):
+                continue
+            matched.append({
+                "time": row["Time"], "predicted_mw": predicted_mw,
+                "actual_mw": actual_mw, "row": row,
+            })
+    return matched
+
+
+def _time_of_day_bucket(time_label: str) -> str:
+    hour = int(time_label[11:13])
+    if hour < 10:
+        return "morning (before 10:00)"
+    if hour < 14:
+        return "midday (10:00-14:00)"
+    return "afternoon (14:00+)"
+
+
+def _analyze_day_patterns(date_str: str, matched: list) -> dict:
+    """
+    Deterministic (no LLM) day-level error + pattern analysis: overall
+    MAE/RMSE/MAPE/Bias, bias broken down by time-of-day bucket, and the
+    single worst-forecast block with the conditions (engineered features)
+    present at that time -- packaged as a compact human-readable summary
+    that later gets fed into the LLM prompt as evidence.
+    """
+    pairs = [(m["predicted_mw"], m["actual_mw"]) for m in matched]
+    metrics = _compute_error_metrics(pairs)
+
+    buckets = {}
+    for m in matched:
+        buckets.setdefault(_time_of_day_bucket(m["time"]), []).append(m["predicted_mw"] - m["actual_mw"])
+    bucket_bias = {bucket: round(sum(errs) / len(errs), 3) for bucket, errs in buckets.items()}
+
+    worst = max(matched, key=lambda m: abs(m["predicted_mw"] - m["actual_mw"]))
+    notable_bits = []
+    for key, label in (
+        ("clouds_bright_pixel_pct", "cloud-layer bright-pixel %"),
+        ("satellite_bright_pixel_pct", "satellite bright-pixel %"),
+        ("motion_coverage_end_pct", "video cloud coverage %"),
+        ("motion_direction_deg", "cloud motion direction (deg, -1=stationary)"),
+        ("solar_elevation_deg", "solar elevation (deg)"),
+    ):
+        if worst["row"].get(key):
+            notable_bits.append(f"{label}={worst['row'][key]}")
+
+    bias = metrics["bias"]
+    bias_direction = "over-forecast" if bias > 0.01 else ("under-forecast" if bias < -0.01 else "roughly balanced")
+    mape_str = f"{metrics['mape_pct']}%" if metrics.get("mape_pct") is not None else "n/a"
+    bucket_text = "; ".join(
+        f"{bucket}: {bucket_bias[bucket]:+} MW" for bucket in sorted(bucket_bias)
+    )
+    worst_error = worst["predicted_mw"] - worst["actual_mw"]
+
+    summary = (
+        f"{date_str}: MAE={metrics['mae']} MW, RMSE={metrics['rmse']} MW, MAPE={mape_str}, "
+        f"Bias={bias:+.3f} MW ({bias_direction}). By time of day -- {bucket_text}. "
+        f"Worst block at {worst['time']}: predicted {worst['predicted_mw']} MW vs actual "
+        f"{worst['actual_mw']} MW (error {worst_error:+.3f} MW)"
+        + (f", conditions: {', '.join(notable_bits)}." if notable_bits else ".")
+    )
+
+    return {
+        "date": date_str,
+        "n_matched_blocks": metrics["n_matched_blocks"],
+        "mae": metrics["mae"],
+        "rmse": metrics["rmse"],
+        "mape_pct": metrics["mape_pct"],
+        "bias": bias,
+        "bias_direction": bias_direction,
+        "time_of_day_bias": bucket_bias,
+        "worst_block": {
+            "time": worst["time"], "predicted_mw": worst["predicted_mw"],
+            "actual_mw": worst["actual_mw"], "error_mw": round(worst_error, 3),
+        },
+        "summary": summary,
+    }
+
+
+def _load_context() -> list:
+    if not config.PREDICTION_CONTEXT_PATH.exists():
+        return []
+    try:
+        return json.loads(config.PREDICTION_CONTEXT_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def _add_day_to_context(entry: dict) -> None:
+    """Adds/replaces today's entry and keeps only the most recent
+    config.CONTEXT_WINDOW_DAYS days, dropping the oldest."""
+    entries = [e for e in _load_context() if e["date"] != entry["date"]]
+    entries.append(entry)
+    entries = sorted(entries, key=lambda e: e["date"])[-config.CONTEXT_WINDOW_DAYS:]
+
+    config.PREDICTION_CONTEXT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    config.PREDICTION_CONTEXT_PATH.write_text(json.dumps(entries, indent=2), encoding="utf-8")
+
+
+def format_context_for_prompt() -> str:
+    """Renders the rolling day-level context as compact text for
+    llm_predictor.py's prompt. Called every run regardless of whether the
+    inbox had new files this run -- it always reflects the last
+    CONTEXT_WINDOW_DAYS days of accumulated learnings."""
+    entries = _load_context()
+    if not entries:
+        return "No recent day-level accuracy history is available yet."
+
+    lines = [f"Recent day-level forecast accuracy and patterns (last {len(entries)} day(s), oldest first):"]
+    lines += [f"- {e['summary']}" for e in entries]
+    lines.append(
+        "If a bias direction or time-of-day tendency repeats across these days, factor it into "
+        "your adjustment; a pattern seen on only one day is weaker evidence than one repeated "
+        "across multiple days."
+    )
+    return "\n".join(lines)
+
+
+def process_actuals_inbox() -> list:
+    """
+    Call once per pipeline run (see run_pipeline.py). Scans
+    config.ACTUALS_INBOX_DIR for new company meter-export CSVs. For each
+    file found: merges it into historic_cases/merged_scada_data.csv,
+    re-syncs actuals into the feature-log case store, runs error/pattern
+    analysis for every day the file touched, folds each day's analysis
+    into the rolling prediction-context file (capped at
+    config.CONTEXT_WINDOW_DAYS days), and archives the file into
+    config.ACTUALS_INBOX_PROCESSED_DIR so it is never re-processed.
+
+    Returns the list of date strings analyzed this call (for logging).
+    """
+    inbox_files = sorted(config.ACTUALS_INBOX_DIR.glob("*.csv"))
+    if not inbox_files:
+        return []
+
+    analyzed_dates = []
+    for csv_path in inbox_files:
+        try:
+            touched_dates = _merge_meter_csv_into_store(csv_path)
+        except (OSError, ValueError, KeyError) as e:
+            print(f"  [WARN] Skipping {csv_path.name} in actuals inbox ({e}).")
+            continue
+
+        sync_historic_case_actuals()
+
+        for date_str in sorted(touched_dates):
+            matched = _load_features_log_rows_for_date(date_str)
+            if not matched:
+                print(f"  [INFO] {csv_path.name}: no predicted+actual matches for {date_str} yet "
+                      f"-- skipping pattern analysis for this date.")
+                continue
+
+            entry = _analyze_day_patterns(date_str, matched)
+            _add_day_to_context(entry)
+            _log_accuracy(
+                {k: entry[k] for k in ("n_matched_blocks", "mae", "rmse", "mape_pct", "bias")},
+                date_str=date_str,
+            )
+            print(f"  [OK] Analyzed {date_str}: {entry['summary']}")
+            analyzed_dates.append(date_str)
+
+        config.ACTUALS_INBOX_PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+        archived_path = config.ACTUALS_INBOX_PROCESSED_DIR / csv_path.name
+        if archived_path.exists():
+            timestamp = datetime.datetime.now().strftime("%H%M%S")
+            archived_path = config.ACTUALS_INBOX_PROCESSED_DIR / f"{csv_path.stem}_{timestamp}{csv_path.suffix}"
+        csv_path.rename(archived_path)
+        print(f"  Archived {csv_path.name} -> {archived_path}")
+
+    return analyzed_dates
 
 
 def run_daily_feedback(actual_csv_path: str) -> None:

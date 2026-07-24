@@ -74,7 +74,8 @@ def _summarize_current_situation(feature_row: dict) -> str:
     return "\n".join(lines) if lines else "(no readable feature summary available)"
 
 
-def _build_prompt(anchor_predictions: list, feature_row: dict, retrieved_cases_text: str) -> str:
+def _build_prompt(anchor_predictions: list, feature_row: dict, retrieved_cases_text: str,
+                   context_text: str) -> str:
     blocks_text = "\n".join(
         f"{i + 1}. time={p['time']}, physics_anchor_mw={p['anchor_mw']}"
         for i, p in enumerate(anchor_predictions)
@@ -85,33 +86,37 @@ You are assisting with short-term solar generation forecasting for a
 plant. A deterministic physics formula has ALREADY produced a baseline
 ("anchor") estimate for each of the next 8 forecast blocks (15-minute
 intervals, covering the next 2 hours). Your job is to ADJUST each anchor
-value based on the retrieved historical evidence below -- NOT to invent
-a new number independently of it.
+value based on the retrieved historical evidence and recent accuracy
+patterns below -- NOT to invent a new number independently of them.
 
 Current situation:
 {_summarize_current_situation(feature_row)}
 
 {retrieved_cases_text}
 
+{context_text}
+
 Physics anchor values for the next 8 blocks (baseline, before your adjustment):
 {blocks_text}
 
-Using ONLY the current situation and the historical evidence above,
-respond with ONLY a raw JSON array -- no markdown code fences, no prose
-before or after. The array must have EXACTLY {len(anchor_predictions)}
-objects, one per block, IN THIS ORDER, each with exactly these keys:
+Using ONLY the current situation and the historical evidence and recent
+accuracy patterns above, respond with ONLY a raw JSON array -- no
+markdown code fences, no prose before or after. The array must have
+EXACTLY {len(anchor_predictions)} objects, one per block, IN THIS ORDER,
+each with exactly these keys:
   "time": the block's time exactly as given above (string)
   "adjusted_mw": your adjusted generation estimate in MW (a plain number,
       not a string). If you have no reason to adjust a block, just repeat
       its physics_anchor_mw value -- do not adjust without a reason drawn
-      from the historical evidence.
+      from the historical evidence or recent accuracy patterns.
   "confidence": "High", "Medium", or "Low", based on how closely the
       retrieved historical cases match the current situation (few/no
       similar cases, or cases with very different conditions, should
       mean lower confidence).
   "reasoning": one short sentence explaining the adjustment (or lack of
-      one), referencing the actual historical evidence above -- do not
-      invent facts not present in the data given to you.
+      one), referencing the actual historical evidence or recent accuracy
+      patterns above -- do not invent facts not present in the data given
+      to you.
 
 Example format (values illustrative only):
 [
@@ -171,7 +176,8 @@ def _parse_llm_response(raw_text: str, anchor_predictions: list) -> list:
     return results
 
 
-def predict_with_llm(anchor_predictions: list, feature_row: dict, retrieved_cases_text: str) -> list:
+def predict_with_llm(anchor_predictions: list, feature_row: dict, retrieved_cases_text: str,
+                      context_text: str = "") -> list:
     """
     Main entry point.
 
@@ -179,6 +185,8 @@ def predict_with_llm(anchor_predictions: list, feature_row: dict, retrieved_case
         for the 8 upcoming forecast blocks (from physics_anchor.py).
     feature_row: the current (most recent capture's) feature dict.
     retrieved_cases_text: output of similarity_retrieval.format_cases_for_prompt().
+    context_text: output of daily_feedback.format_context_for_prompt() -- the
+        rolling last few days' error/pattern analysis from real meter data.
 
     Returns a list of dicts, one per block:
         {"time", "block_number", "anchor_mw", "llm_mw", "confidence", "reasoning"}
@@ -193,7 +201,7 @@ def predict_with_llm(anchor_predictions: list, feature_row: dict, retrieved_case
         return _parse_llm_response("[]", anchor_predictions)
 
     client = genai.Client(api_key=config.GEMINI_API_KEY, vertexai=False)
-    prompt = _build_prompt(anchor_predictions, feature_row, retrieved_cases_text)
+    prompt = _build_prompt(anchor_predictions, feature_row, retrieved_cases_text, context_text)
 
     max_retries = 4
     base_delay = 5

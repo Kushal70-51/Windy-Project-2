@@ -59,6 +59,13 @@ def run_prediction_pipeline(image_map: dict, video_path):
     if synced_actuals:
         print(f"\nSynced {synced_actuals} historical SCADA actual(s) into the case store.")
 
+    # Pick up any actual-meter CSV the company dropped in daily_actuals_inbox/
+    # since the last run: merge it into the case store, run error/pattern
+    # analysis for that day, and fold it into the rolling prediction context.
+    analyzed_dates = daily_feedback.process_actuals_inbox()
+    if analyzed_dates:
+        print(f"\nProcessed new actual-meter data from the inbox for: {', '.join(analyzed_dates)}")
+
     print("\nExtracting image features (color + brightness per layer)...")
     image_features = image_feature_extraction.extract_image_features(image_map)
     print(f"  [OK] Extracted {len(image_features)} image-derived features.")
@@ -116,8 +123,9 @@ def run_prediction_pipeline(image_map: dict, video_path):
 
     # ---- Phase 3: LLM adjusts the anchor using the retrieved evidence ----
     print("\nAsking LLM to adjust physics anchor using retrieved evidence...")
+    context_text = daily_feedback.format_context_for_prompt()
     llm_predictions = llm_predictor.predict_with_llm(
-        anchor_predictions, current_feature_row, retrieved_cases_text,
+        anchor_predictions, current_feature_row, retrieved_cases_text, context_text,
     )
 
     # ---- Phase 4: validate (range/deviation/smoothness safety checks) ----

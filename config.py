@@ -86,6 +86,22 @@ MODELS_DIR = Path("models")
 ACCURACY_REPORTS_DIR = Path("accuracy_reports")
 HISTORIC_CASES_DIR = Path("historic_cases")
 
+# ---- Daily actuals feedback automation ----
+# Drop the plant's actual meter-export CSV here at the end of each day.
+# Every pipeline run (see daily_feedback.process_actuals_inbox(), called
+# from run_pipeline.py) automatically merges any new file here into
+# historic_cases/merged_scada_data.csv, compares that day's predictions
+# against the actuals, and archives the raw file into the "processed"
+# subfolder so it's never re-processed.
+ACTUALS_INBOX_DIR = Path("daily_actuals_inbox")
+ACTUALS_INBOX_PROCESSED_DIR = ACTUALS_INBOX_DIR / "processed"
+
+# Rolling day-level accuracy/pattern context fed into the LLM prompt (see
+# llm_predictor.py) -- keeps only the most recent CONTEXT_WINDOW_DAYS days,
+# dropping the oldest each time a new day is added.
+PREDICTION_CONTEXT_PATH = Path("prediction_context") / f"{PLANT_NAME}_context.json"
+CONTEXT_WINDOW_DAYS = 3
+
 # ---- Case-Based Reasoning retrieval ----
 # These weights express the relative importance of visual conditions and
 # solar position when comparing a new situation with past feature rows.
@@ -104,7 +120,8 @@ CBR_FEATURE_WEIGHTS = {
     "solarpower_bright_pixel_pct": 1.0,
 }
 
-for _dir in (SCREENSHOT_DIR, VIDEO_DIR, PREDICTIONS_DIR, FEATURES_LOG_DIR, MODELS_DIR, ACCURACY_REPORTS_DIR, HISTORIC_CASES_DIR):
+for _dir in (SCREENSHOT_DIR, VIDEO_DIR, PREDICTIONS_DIR, FEATURES_LOG_DIR, MODELS_DIR, ACCURACY_REPORTS_DIR,
+             HISTORIC_CASES_DIR, ACTUALS_INBOX_DIR, ACTUALS_INBOX_PROCESSED_DIR, PREDICTION_CONTEXT_PATH.parent):
     _dir.mkdir(parents=True, exist_ok=True)
 
 MODEL_PATH = MODELS_DIR / "generation_model.pkl"
